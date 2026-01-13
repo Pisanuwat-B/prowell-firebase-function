@@ -6,19 +6,24 @@ const logger = require("firebase-functions/logger");
 const axios = require('axios');
 
 exports.dailyUserScan = onSchedule({
-  schedule: "*/10 3-6 * * *", // Run every 10 mins, between 3am and 6am
+  schedule: "*/10 3-6 * * *", 
   timeZone: "Asia/Bangkok",
 }, async (event) => {
   const db = admin.firestore();
   const now = admin.firestore.Timestamp.now();
   
-  // This setup can only process 900 users/day
+  // Refined Query: Check both consent fields and the schedule
   const usersSnap = await db.collection('users')
+    .where('consent.consent_ai_processing', '==', true)
+    .where('consent.consent_product_recommendation', '==', true)
     .where('next_weekly_report_at', '<=', now)
-    .limit(50) 
+    .limit(100) 
     .get();
 
-  if (usersSnap.empty) return;
+  if (usersSnap.empty) {
+    logger.info("No eligible users with consent found.");
+    return;
+  }
 
   const queue = getFunctions().taskQueue("processWeeklyReport");
   
@@ -27,7 +32,7 @@ exports.dailyUserScan = onSchedule({
   });
 
   await Promise.all(promises);
-  logger.info(`Enqueued ${usersSnap.size} tasks.`);
+  logger.info(`Enqueued ${usersSnap.size} tasks with full consent.`);
 });
 
 exports.processWeeklyReport = onTaskDispatched(
@@ -79,14 +84,22 @@ async function getLast7DailyLogs(userRef) {
 }
 
 async function generateWeeklyReport(payload) {
-    try {
-    const response = await axios.post('AI_TEAM_ENDPOINT', payload, {
-      timeout: 180000, // Wait for 3 minutes (180,000ms)
-      headers: { 'Authorization': `Bearer ${process.env.AI_API_KEY}` }
-    });
-    return response.data;
-  } catch (error) {
-    logger.error("AI API Error", error);
-    throw error; // Throwing error triggers the Task Queue to retry!
-  }
+  // try {
+  //   const response = await axios.post('AI_TEAM_ENDPOINT', payload, {
+  //     timeout: 180000, // Wait for 3 minutes (180,000ms)
+  //     headers: { 'Authorization': `Bearer ${process.env.AI_API_KEY}` }
+  //   });
+  //   return response.data;
+  // } catch (error) {
+  //   logger.error("AI API Error", error);
+  //   throw error;
+  // }
+
+  return {
+    summary: 'สุขภาพโดยรวมอยู่ในเกณฑ์ปานกลาง',
+    risks: ['การนอนหลับไม่สม่ำเสมอ'],
+    recommendations: ['ควรนอนให้ครบ 7–8 ชั่วโมง', 'เพิ่มกิจกรรมการเดินในแต่ละวัน'],
+    generated_at: new Date(),
+    source: 'Mockup data',
+  };
 }
