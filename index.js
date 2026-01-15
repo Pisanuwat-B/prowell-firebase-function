@@ -1,9 +1,43 @@
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { getFunctions } = require("firebase-admin/functions");
 const { onTaskDispatched } = require("firebase-functions/v2/tasks");
+const { onRequest } = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 const logger = require("firebase-functions/logger");
 const axios = require('axios');
+
+// MANUAL TRIGGER for testing
+exports.manualDailyScan = onRequest(async (req, res) => {
+  logger.info("Manual trigger started");
+  
+  // We simply call the same logic as your scheduler
+  // You might want to wrap your boss logic in a named function to reuse it perfectly
+  try {
+    const db = admin.firestore();
+    const now = admin.firestore.Timestamp.now();
+    
+    const usersSnap = await db.collection('users')
+      .where('consent.consent_ai_processing', '==', true)
+      .where('consent.consent_product_recommendation', '==', true)
+      .where('next_weekly_report_at', '<=', now)
+      .limit(100) 
+      .get();
+
+    logger.info(`Test found ${usersSnap.size} users`);
+    
+    // Log exactly which IDs were picked up
+    usersSnap.docs.forEach(doc => logger.info(`Picked up user: ${doc.id}`));
+
+    const queue = getFunctions().taskQueue("processWeeklyReport");
+    const promises = usersSnap.docs.map(doc => queue.enqueue({ userId: doc.id }));
+    await Promise.all(promises);
+
+    res.status(200).send(`Enqueued ${usersSnap.size} users. Check logs for worker progress.`);
+  } catch (err) {
+    logger.error("Manual trigger failed", err);
+    res.status(500).send(err.message);
+  }
+});
 
 exports.dailyUserScan = onSchedule({
   schedule: "*/10 3-6 * * *", 
@@ -60,6 +94,11 @@ exports.processWeeklyReport = onTaskDispatched(
       });
       return;
     }
+
+		logger.info(`Processing report for ${userId}`, {
+			logCount: dailyLogs.length,
+			payloadSample: dailyLogs[0] // Check if fields like log_date are correct
+		});
 
     const aiResult = await generateWeeklyReport({ user: userSnap.data(), dailyLogs });
 
