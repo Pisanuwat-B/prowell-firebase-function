@@ -13,7 +13,7 @@ admin.initializeApp();
 
 // MANUAL TRIGGER for testing
 exports.manualDailyScan = onRequest({ region: REGION }, async (req, res) => {
-  logger.info("Manual trigger v1.4 started");
+  logger.info("Manual trigger started");
 	logger.info("Project ID:", process.env.GCLOUD_PROJECT);
   
   // We simply call the same logic as your scheduler
@@ -50,6 +50,7 @@ exports.dailyUserScan = onSchedule({
   schedule: "*/10 3-6 * * *", 
   timeZone: "Asia/Bangkok",
 }, async (event) => {
+	logger.info("Scheduler started");
   const db = admin.firestore();
   const now = Timestamp.now();
   
@@ -92,21 +93,22 @@ exports.processWeeklyReport = onTaskDispatched(
     if (!userSnap.exists) return;
 
     const dailyLogs = await getLast7DailyLogs(userRef);
+		const distinctDays = countDistinctLogDays(dailyLogs);
     
     const nextDate = new Date();
     nextDate.setDate(nextDate.getDate() + 7);
 
-    if (dailyLogs.length < 3) {
-      await userRef.update({ 
-        next_weekly_report_at: Timestamp.fromDate(nextDate) 
-      });
-      return;
-    }
+    if (distinctDays < 3) {
+			await userRef.update({
+				next_weekly_report_at: Timestamp.fromDate(nextDate),
+			});
+			logger.info(`User ${userId} has insufficient time coverage`, {
+				distinctDays,
+			});
+			return;
+		}
 
-		logger.info(`Processing report for ${userId}`, {
-			logCount: dailyLogs.length,
-			payloadSample: dailyLogs[0] // Check if fields like log_date are correct
-		});
+		logger.info(`Processing report for ${userId} with log count: ${dailyLogs.length}`);
 
     const aiResult = await generateWeeklyReport({ user: userSnap.data(), dailyLogs });
 
@@ -121,13 +123,27 @@ exports.processWeeklyReport = onTaskDispatched(
 );
 
 async function getLast7DailyLogs(userRef) {
+  const sevenDaysAgo = Timestamp.fromDate(
+    new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+  );
+
   const snap = await userRef
     .collection('daily_logs')
-    .orderBy('log_date', 'desc')
-    .limit(7)
+    .where('log_date', '>=', sevenDaysAgo)
     .get();
 
   return snap.docs.map(doc => doc.data());
+}
+
+function countDistinctLogDays(dailyLogs) {
+  const days = new Set();
+
+  dailyLogs.forEach(log => {
+    const d = log.log_date.toDate().toISOString().slice(0, 10);
+    days.add(d);
+  });
+
+  return days.size;
 }
 
 async function generateWeeklyReport(payload) {
