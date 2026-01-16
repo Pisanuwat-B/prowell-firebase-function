@@ -13,9 +13,8 @@ admin.initializeApp();
 
 // MANUAL TRIGGER for testing
 exports.manualDailyScan = onRequest({ region: REGION }, async (req, res) => {
-  logger.info("Manual trigger started");
+  logger.info("Manual trigger v1.4 started");
 	logger.info("Project ID:", process.env.GCLOUD_PROJECT);
-	logger.info("Firestore emulator:", process.env.FIRESTORE_EMULATOR_HOST || "NOT SET");
   
   // We simply call the same logic as your scheduler
   // You might want to wrap your boss logic in a named function to reuse it perfectly
@@ -35,7 +34,7 @@ exports.manualDailyScan = onRequest({ region: REGION }, async (req, res) => {
     // Log exactly which IDs were picked up
     usersSnap.docs.forEach(doc => logger.info(`Picked up user: ${doc.id}`));
 
-    const queue = getFunctions(undefined, "asia-southeast1").taskQueue("processWeeklyReport");
+    const queue = getFunctions().taskQueue(`locations/${REGION}/functions/processWeeklyReport`);
     const promises = usersSnap.docs.map(doc => queue.enqueue({ userId: doc.id }));
     await Promise.all(promises);
 
@@ -67,8 +66,8 @@ exports.dailyUserScan = onSchedule({
     return;
   }
 
-  const queue = getFunctions(undefined, "asia-southeast1").taskQueue("processWeeklyReport");
-  
+  const queue = getFunctions().taskQueue(`locations/${REGION}/functions/processWeeklyReport`);
+
   const promises = usersSnap.docs.map(doc => {
     return queue.enqueue({ userId: doc.id });
   });
@@ -80,7 +79,6 @@ exports.dailyUserScan = onSchedule({
 exports.processWeeklyReport = onTaskDispatched(
   {
 		region: REGION,
-		taskQueue: "processWeeklyReport",
     timeoutSeconds: 300, // Give it 5 minutes per user to be safe
     memory: "1GiB",
     retryConfig: { maxAttempts: 3 },
