@@ -77,51 +77,6 @@ exports.dailyUserScan = onSchedule({
   logger.info(`Enqueued ${usersSnap.size} tasks with full consent.`);
 });
 
-exports.processWeeklyReport = onTaskDispatched(
-  {
-		region: REGION,
-    timeoutSeconds: 300, // Give it 5 minutes per user to be safe
-    memory: "1GiB",
-    retryConfig: { maxAttempts: 3 },
-    rateLimits: { maxConcurrentDispatches: 10 } // Only 10 calls at once
-  },
-  async (request) => {
-    const userId = request.data.userId; // Data passed from the Dispatcher
-    const userRef = admin.firestore().collection('users').doc(userId);
-    const userSnap = await userRef.get();
-    
-    if (!userSnap.exists) return;
-
-    const dailyLogs = await getLast7DailyLogs(userRef);
-		const distinctDays = countDistinctLogDays(dailyLogs);
-    
-    const nextDate = new Date();
-    nextDate.setDate(nextDate.getDate() + 7);
-
-    if (distinctDays < 3) {
-			await userRef.update({
-				next_weekly_report_at: Timestamp.fromDate(nextDate),
-			});
-			logger.info(`User ${userId} has insufficient time coverage`, {
-				distinctDays,
-			});
-			return;
-		}
-
-		logger.info(`Processing report for ${userId} with log count: ${dailyLogs.length}`);
-
-    const aiResult = await generateWeeklyReport({ user: userSnap.data(), dailyLogs });
-
-    const batch = admin.firestore().batch();
-    batch.set(userRef.collection('weekly_reports').doc(), { ...aiResult });
-    batch.update(userRef, { 
-      next_weekly_report_at: Timestamp.fromDate(nextDate) 
-    });
-    
-    await batch.commit();
-  }
-);
-
 async function getLast7DailyLogs(userRef) {
   const sevenDaysAgo = Timestamp.fromDate(
     new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
@@ -146,23 +101,78 @@ function countDistinctLogDays(dailyLogs) {
   return days.size;
 }
 
-async function generateWeeklyReport(payload) {
-  // try {
-  //   const response = await axios.post('AI_TEAM_ENDPOINT', payload, {
-  //     timeout: 180000, // Wait for 3 minutes (180,000ms)
-  //     headers: { 'Authorization': `Bearer ${process.env.AI_API_KEY}` }
-  //   });
-  //   return response.data;
-  // } catch (error) {
-  //   logger.error("AI API Error", error);
-  //   throw error;
-  // }
+exports.processWeeklyReport = onTaskDispatched(
+  {
+		region: REGION,
+    timeoutSeconds: 300, // Give it 5 minutes per user to be safe
+    memory: "1GiB",
+    retryConfig: { maxAttempts: 3 },
+    rateLimits: { maxConcurrentDispatches: 10 } // Only 10 calls at once
+  },
+  async (request) => {
+    const userId = request.data.userId; // Data passed from the Dispatcher
+    const userRef = admin.firestore().collection('users').doc(userId);
+    const userSnap = await userRef.get();
+    
+    if (!userSnap.exists) return;
 
-  return {
-    summary: 'สุขภาพโดยรวมอยู่ในเกณฑ์ปานกลาง',
-    risks: ['การนอนหลับไม่สม่ำเสมอ'],
-    recommendations: ['ควรนอนให้ครบ 7–8 ชั่วโมง', 'เพิ่มกิจกรรมการเดินในแต่ละวัน'],
-    generated_at: new Date(),
-    source: 'Mockup data',
-  };
+    const dailyLogs = await getLast7DailyLogs(userRef);
+		const distinctDays = countDistinctLogDays(dailyLogs);
+
+    const now = new Date();
+    const reportWeekEnd = new Date(now);
+    const reportWeekStart = new Date(now);
+    reportWeekStart.setDate(reportWeekStart.getDate() - 7);
+    
+    const nextDate = new Date();
+    nextDate.setDate(nextDate.getDate() + 7);
+
+    if (distinctDays < 3) {
+			await userRef.update({
+				next_weekly_report_at: Timestamp.fromDate(nextDate),
+			});
+			logger.info(`User ${userId} has insufficient time coverage`, {
+				distinctDays,
+			});
+			return;
+		}
+
+		logger.info(`Processing report for ${userId} with log count: ${dailyLogs.length}`);
+
+    const aiResult = await generateWeeklyReport({
+      user: userSnap.data(),
+      dailyLogs,
+      report_week_start: reportWeekStart,
+      report_week_end: reportWeekEnd,
+    });
+
+    const batch = admin.firestore().batch();
+    const reportRef = userRef.collection("weekly_reports").doc();
+    batch.set(reportRef, {
+      ...aiResult,
+      created_at: Timestamp.fromDate(now),
+      report_week_start: Timestamp.fromDate(reportWeekStart),
+      report_week_end: Timestamp.fromDate(reportWeekEnd),
+      model_version: "mock-v1",
+    });
+
+    batch.update(userRef, {
+      next_weekly_report_at: Timestamp.fromDate(nextDate),
+    });
+    
+    await batch.commit();
+  }
+);
+
+async function generateWeeklyReport(payload) {
+  try {
+    const response = await axios.post('https://asia-southeast1-prowell-health-span.cloudfunctions.net/query_rag', payload, {
+      timeout: 300000, // Wait for 5 mins
+      headers: { 'Content-Type': 'application/json' }
+    });
+    return response.data;
+  } catch (error) {
+    logger.error("AI API Error", error);
+    throw error;
+  }
 }
