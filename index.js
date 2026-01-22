@@ -126,6 +126,9 @@ exports.processWeeklyReport = onTaskDispatched(
     
     const nextDate = new Date();
     nextDate.setDate(nextDate.getDate() + 7);
+    const startTime = new Date().toISOString(); // Record start of the task
+    
+    logger.info(`[Task Start] User: ${userId} with log count: ${dailyLogs.length} at ${startTime}`);
 
     if (distinctDays < 3) {
 			await userRef.update({
@@ -137,14 +140,14 @@ exports.processWeeklyReport = onTaskDispatched(
 			return;
 		}
 
-		logger.info(`Processing report for ${userId} with log count: ${dailyLogs.length}`);
+    const userData = normalizeFirestoreValue(userSnap.data());
+    userData.daily_logs = normalizeFirestoreValue(dailyLogs);
+    userData.health_history = await fetchSubcollection(userRef, "health_history");
 
-    const aiResult = await generateWeeklyReport({
-      user: userSnap.data(),
-      dailyLogs,
-      report_week_start: reportWeekStart,
-      report_week_end: reportWeekEnd,
-    });
+    const aiResult = await generateWeeklyReport(userData);
+
+    const aiReqEnd = new Date().toISOString();
+    logger.info(`[AI Response] User: ${userId} received at ${aiReqEnd}`);
 
     const batch = admin.firestore().batch();
     const reportRef = userRef.collection("weekly_reports").doc();
@@ -163,6 +166,46 @@ exports.processWeeklyReport = onTaskDispatched(
     await batch.commit();
   }
 );
+
+async function fetchSubcollection(userRef, name) {
+  const snap = await userRef.collection(name).get();
+  return snap.docs.map(doc =>
+    normalizeFirestoreValue({
+      id: doc.id,
+      ...doc.data(),
+    })
+  );
+}
+
+function normalizeFirestoreValue(value) {
+  if (value === null || value === undefined) return value;
+
+  // Firestore Timestamp
+  if (value instanceof admin.firestore.Timestamp) {
+    return value.toDate().toISOString();
+  }
+
+  // Firestore DocumentReference
+  if (value.path && value.id) {
+    return value.path;
+  }
+
+  // Array
+  if (Array.isArray(value)) {
+    return value.map(normalizeFirestoreValue);
+  }
+
+  // Object
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = normalizeFirestoreValue(v);
+    }
+    return out;
+  }
+
+  return value;
+}
 
 async function generateWeeklyReport(payload) {
   try {
