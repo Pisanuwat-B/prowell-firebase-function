@@ -77,17 +77,28 @@ exports.dailyUserScan = onSchedule({
   logger.info(`Enqueued ${usersSnap.size} tasks with full consent.`);
 });
 
-async function getLast7DailyLogs(userRef) {
-  const sevenDaysAgo = Timestamp.fromDate(
-    new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+async function getLast14DailyLogs(userRef) {
+  const fourteenDaysAgo = Timestamp.fromDate(
+    new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
   );
 
   const snap = await userRef
     .collection('daily_logs')
-    .where('log_date', '>=', sevenDaysAgo)
+    .where('log_date', '>=', fourteenDaysAgo)
     .get();
 
   return snap.docs.map(doc => doc.data());
+}
+
+function getCurrentWeekLogs(dailyLogs) {
+  const now = new Date();
+  const sevenDaysAgo = new Date();
+  sevenDaysAgo.setDate(now.getDate() - 7);
+
+  return dailyLogs.filter(log => {
+    const logDate = log.log_date.toDate();
+    return logDate >= sevenDaysAgo && logDate <= now;
+  });
 }
 
 function countDistinctLogDays(dailyLogs) {
@@ -116,8 +127,9 @@ exports.processWeeklyReport = onTaskDispatched(
     
     if (!userSnap.exists) return;
 
-    const dailyLogs = await getLast7DailyLogs(userRef);
-		const distinctDays = countDistinctLogDays(dailyLogs);
+    const dailyLogs = await getLast14DailyLogs(userRef);
+    const currentWeekLogs = getCurrentWeekLogs(dailyLogs);
+    const distinctDays = countDistinctLogDays(currentWeekLogs);
 
     const now = new Date();
     const reportWeekEnd = new Date(now);
@@ -150,7 +162,8 @@ exports.processWeeklyReport = onTaskDispatched(
     logger.info(`[AI Response] User: ${userId} received at ${aiReqEnd}`);
 
     const batch = admin.firestore().batch();
-    const reportRef = userRef.collection("weekly_reports").doc();
+    const reportId = reportWeekStart.toISOString().slice(0, 10);
+    const reportRef = userRef.collection("weekly_reports").doc(reportId);
     batch.set(reportRef, {
       ...aiResult,
       created_at: Timestamp.fromDate(now),
