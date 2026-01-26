@@ -43,6 +43,7 @@ exports.manualDailyScan = onRequest({ region: REGION }, async (req, res) => {
     logger.error("Manual trigger failed", err);
     res.status(500).send(err.message);
   }
+
 });
 
 exports.dailyUserScan = onSchedule({
@@ -170,6 +171,7 @@ exports.processWeeklyReport = onTaskDispatched(
       report_week_start: Timestamp.fromDate(reportWeekStart),
       report_week_end: Timestamp.fromDate(reportWeekEnd),
       model_version: "mock-v1",
+      notification_red: false,
     });
 
     batch.update(userRef, {
@@ -177,6 +179,8 @@ exports.processWeeklyReport = onTaskDispatched(
     });
     
     await batch.commit();
+
+    await sendWeeklyReportNotification(userId);
   }
 );
 
@@ -231,4 +235,75 @@ async function generateWeeklyReport(payload) {
     logger.error("AI API Error", error);
     throw error;
   }
+}
+
+async function sendWeeklyReportNotification(userId) {
+  const userRef = admin.firestore().collection("users").doc(userId);
+  const tokensSnap = await userRef.collection("fcm_tokens").get();
+
+  logger.info(`Send push to User: ${userId} `);
+
+  if (tokensSnap.empty) {
+    logger.info(`No FCM tokens for user ${userId}`);
+    return;
+  }
+
+  const tokens = [];
+  tokensSnap.forEach(doc => tokens.push(doc.id));
+
+  const message = {
+    tokens,
+    notification: {
+      title: "Your weekly health report is ready",
+      body: "Tap to see your insights and progress",
+    },
+    data: {
+      type: "weekly_report",
+      userId,
+    },
+    android: {
+      priority: "high",
+    },
+    apns: {
+      payload: {
+        aps: {
+          sound: "default",
+        },
+      },
+    },
+  };
+
+  const response = await admin.messaging().sendEachForMulticast(message);
+
+  logger.info(`Push sent to user ${userId}`, {
+    success: response.successCount,
+    failure: response.failureCount,
+  });
+
+  response.responses.forEach((res, idx) => {
+    if (!res.success) {
+      logger.error("FCM send error", {
+        token: tokens[idx],
+        code: res.error?.code,
+        message: res.error?.message,
+      });
+    }
+});
+
+  const batch = admin.firestore().batch();
+  response.responses.forEach((res, idx) => {
+    if (!res.success) {
+      const errCode = res.error?.code;
+      if (
+        errCode === "messaging/registration-token-not-registered" ||
+        errCode === "messaging/invalid-registration-token"
+      ) {
+        const badToken = tokens[idx];
+        batch.delete(userRef.collection("fcm_tokens").doc(badToken));
+        logger.warn(`Removed invalid FCM token`, { badToken });
+      }
+    }
+  });
+
+  await batch.commit();
 }
