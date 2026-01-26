@@ -171,7 +171,7 @@ exports.processWeeklyReport = onTaskDispatched(
       report_week_start: Timestamp.fromDate(reportWeekStart),
       report_week_end: Timestamp.fromDate(reportWeekEnd),
       model_version: "mock-v1",
-      notification_red: false,
+      notification_read: false,
     });
 
     batch.update(userRef, {
