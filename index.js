@@ -136,22 +136,36 @@ exports.processWeeklyReport = onTaskDispatched(
     const reportWeekEnd = new Date(now);
     const reportWeekStart = new Date(now);
     reportWeekStart.setDate(reportWeekStart.getDate() - 7);
-    
+    let reportType;
+    if (!hasInitial) {
+      reportType = "initial";
+    } else {
+      reportType = "weekly";
+    }
+
     const nextDate = new Date();
     nextDate.setDate(nextDate.getDate() + 7);
     const startTime = new Date().toISOString(); // Record start of the task
     
     logger.info(`[Task Start] User: ${userId} with log count: ${dailyLogs.length} at ${startTime}`);
 
-    if (distinctDays < 3) {
-			await userRef.update({
-				next_weekly_report_at: Timestamp.fromDate(nextDate),
-			});
-			logger.info(`User ${userId} has insufficient time coverage`, {
-				distinctDays,
-			});
-			return;
-		}
+    const hasInitial = userSnap.data().has_received_initial_report === true;
+
+    if (!hasInitial) {
+      await userRef.update({
+        next_weekly_report_at: Timestamp.fromDate(nextDate),
+      });
+      return;
+    } else {
+      // Weekly report: require real coverage
+      if (distinctDays < 3) {
+        await userRef.update({
+          next_weekly_report_at: Timestamp.fromDate(nextDate),
+        });
+			logger.info(`User ${userId} has insufficient time coverage: ${distinctDays}`);
+        return;
+      }
+    }
 
     const userData = normalizeFirestoreValue(userSnap.data());
     userData.daily_logs = normalizeFirestoreValue(dailyLogs);
@@ -172,15 +186,22 @@ exports.processWeeklyReport = onTaskDispatched(
       report_week_end: Timestamp.fromDate(reportWeekEnd),
       model_version: "mock-v1",
       notification_read: false,
+      report_type: reportType,
     });
 
     batch.update(userRef, {
       next_weekly_report_at: Timestamp.fromDate(nextDate),
     });
+
+    if (!hasInitial) {
+      batch.update(userRef, {
+        has_received_initial_report: true,
+      });
+    }
     
     await batch.commit();
 
-    await sendWeeklyReportNotification(userId);
+    await sendWeeklyReportNotification(userId, reportType);
   }
 );
 
@@ -237,7 +258,7 @@ async function generateWeeklyReport(payload) {
   }
 }
 
-async function sendWeeklyReportNotification(userId) {
+async function sendWeeklyReportNotification(userId, reportType) {
   const userRef = admin.firestore().collection("users").doc(userId);
   const tokensSnap = await userRef.collection("fcm_tokens").get();
 
@@ -251,14 +272,19 @@ async function sendWeeklyReportNotification(userId) {
   const tokens = [];
   tokensSnap.forEach(doc => tokens.push(doc.id));
 
+   const titleMap = {
+    weekly: "Your weekly health report is ready",
+    initial: "Your first health report is ready",
+  };
+
   const message = {
     tokens,
     notification: {
-      title: "Your weekly health report is ready",
+      title: titleMap[reportType] ?? "Your health report is ready",
       body: "Tap to see your insights and progress",
     },
     data: {
-      type: "weekly_report",
+      type: reportType,
       userId,
     },
     android: {
@@ -288,7 +314,7 @@ async function sendWeeklyReportNotification(userId) {
         message: res.error?.message,
       });
     }
-});
+  });
 
   const batch = admin.firestore().batch();
   response.responses.forEach((res, idx) => {
