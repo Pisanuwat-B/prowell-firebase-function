@@ -137,6 +137,9 @@ exports.processWeeklyReport = onTaskDispatched(
     const reportWeekStart = new Date(now);
     reportWeekStart.setDate(reportWeekStart.getDate() - 7);
     let reportType;
+
+    const hasInitial = userSnap.data().has_received_initial_report === true;
+
     if (!hasInitial) {
       reportType = "initial";
     } else {
@@ -149,20 +152,17 @@ exports.processWeeklyReport = onTaskDispatched(
     
     logger.info(`[Task Start] User: ${userId} with log count: ${dailyLogs.length} at ${startTime}`);
 
-    const hasInitial = userSnap.data().has_received_initial_report === true;
-
     if (!hasInitial) {
       await userRef.update({
         next_weekly_report_at: Timestamp.fromDate(nextDate),
       });
-      return;
     } else {
       // Weekly report: require real coverage
       if (distinctDays < 3) {
         await userRef.update({
           next_weekly_report_at: Timestamp.fromDate(nextDate),
         });
-			logger.info(`User ${userId} has insufficient time coverage: ${distinctDays}`);
+			  logger.info(`User ${userId} has insufficient time coverage: ${distinctDays}`);
         return;
       }
     }
