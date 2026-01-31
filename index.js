@@ -171,7 +171,9 @@ exports.processWeeklyReport = onTaskDispatched(
     userData.daily_logs = normalizeFirestoreValue(dailyLogs);
     userData.health_history = await fetchSubcollection(userRef, "health_history");
 
-    const aiResult = await generateWeeklyReport(userData);
+    const aiUserPayload = buildAIUserPayload(userData);
+
+    const aiResult = await generateWeeklyReport(aiUserPayload);
 
     const aiReqEnd = new Date().toISOString();
     logger.info(`[AI Response] User: ${userId} received at ${aiReqEnd}`);
@@ -243,6 +245,86 @@ function normalizeFirestoreValue(value) {
   }
 
   return value;
+}
+
+function buildAIUserPayload(user) {
+
+  const payload = {
+    age: user.Age,
+    gender: user.Gender,
+    height_cm: user.height_cm,
+    weight_kg: user.weight_kg,
+    conditions: user.conditions,
+    chronic_issues: user.chronic_issues,
+  };
+
+  // ---------- HEALTH HISTORY ----------
+  if (Array.isArray(user.health_history) && user.health_history.length > 0) {
+
+    const latest = user.health_history[user.health_history.length - 1];
+
+    const biomarkers = {};
+
+    const numericFields = [
+      "HDL",
+      "fbs",
+      "LDL",
+      "Cholesterol",
+      "Triglycerides",
+      "systolic",
+      "diastolic",
+      "Heartrate"
+    ];
+
+    numericFields.forEach(field => {
+      const value = Number(latest[field]);
+      if (value > 0) {
+        biomarkers[field] = value;
+      }
+    });
+
+    if (Object.keys(biomarkers).length > 0) {
+      payload.biomarkers = biomarkers;
+    }
+  }
+
+  // ---------- DAILY LOGS ----------
+  payload.daily_logs = (user.daily_logs || []).map(log => ({
+    
+    log_date_key: log.log_date_key,
+
+    mood_score: log.mind?.mood_score,
+    stress_score: log.mind?.stress_score,
+
+    sleep_hours: log.sleep?.sleep_duration_hours,
+    wakeup_feeling: log.sleep?.wakeup_feeling,
+
+    water_liters: log.nutrition?.water_liters,
+
+    exercise: (log.exercise || []).map(e => ({
+      activity_level: e.activity_level,
+      mvpa_minutes: e.mvpa_minutes,
+      estimated_steps: e.estimated_steps,
+    })),
+
+    meals: (log.nutrition?.meals || []).map(m => ({
+      meal_type: m.meal_type,
+      food: m.base_text,
+    })),
+
+    upf: (log.nutrition?.upf_logs || []).map(u => ({
+      category: u.category_tag,
+      item: u.upf_item_name,
+      tastes: u.taste_tags,
+    })),
+
+    cigarettes: log.risk?.cigarettes_count,
+    alcohol_drinks: log.risk?.alcohol_drinks,
+    quit_intention_score: log.risk?.quit_intention_score,
+    first_cig_after_wake_min: log.risk?.first_cig_after_wake_min,
+  }));
+
+  return payload;
 }
 
 async function generateWeeklyReport(payload) {
