@@ -318,8 +318,10 @@ function clean(data) {
 function buildAIUserPayload(user, reportType) {
 
   // ---------- USER PROFILE ----------
+  const todayKey = new Date().toISOString().slice(0, 10); // 'yyyy-mm-dd'
   const payload = {
     report_type:    reportType,   // 'initial' | 'weekly'
+    today:          todayKey,
     age:            user.Age,
     gender:         standardizeValue(user.Gender, GENDER_MAP),
     height_cm:      user.height_cm,
