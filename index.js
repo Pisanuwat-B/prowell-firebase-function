@@ -191,7 +191,7 @@ exports.processWeeklyReport = onTaskDispatched(
     userData.daily_logs = normalizeFirestoreValue(dailyLogs);
     userData.health_history = await fetchSubcollection(userRef, "health_history");
 
-    const aiUserPayload = buildAIUserPayload(userData);
+    const aiUserPayload = buildAIUserPayload(userData, reportType);
 
     const aiResult = await generateWeeklyReport(aiUserPayload);
 
@@ -206,7 +206,7 @@ exports.processWeeklyReport = onTaskDispatched(
       created_at: Timestamp.fromDate(now),
       report_week_start: Timestamp.fromDate(reportWeekStart),
       report_week_end: Timestamp.fromDate(reportWeekEnd),
-      model_version: "mock-v1",
+      model_version: "prowell-v1",
       notification_read: false,
       report_type: reportType,
     });
@@ -267,88 +267,148 @@ function normalizeFirestoreValue(value) {
   return value;
 }
 
-function buildAIUserPayload(user) {
+// ─── Thai → English lookup maps ──────────────────────────────────────────────
+const GENDER_MAP      = { 'ชาย': 'male', 'หญิง': 'female' };
+const PORTION_MAP     = { 'บุฟเฟ่': 'buffet', 'มากกว่าปกติ': 'large', 'ปกติ': 'normal', 'น้อยกว่าปกติ': 'small' };
+const MEAL_TYPE_MAP   = { 'เช้า': 'breakfast', 'ว่าง': 'snack', 'เที่ยง': 'lunch', 'เย็น': 'dinner' };
+const VEG_LEVEL_MAP   = { '0/4 จาน': '0/4 plate', '1/4 จาน': '1/4 plate', '2/4 จาน': '2/4 plate', '3/4 จาน': '3/4 plate', '4/4 จาน': '4/4 plate' };
+const UPF_TYPE_MAP    = { 'ขนมหวาน': 'sweets', 'เครื่องดื่ม': 'beverage', 'ของทอด': 'fried_food', 'อาหารกึ่งสำเร็จรูป': 'instant_food', 'อาหารหมัก/ดอง': 'fermented_food' };
+const UPF_PORTION_MAP = { 'ปกติ': 'normal', 'เล็ก': 'small', 'ใหญ่': 'large' };
+const UPF_TASTE_MAP   = { 'หวาน': 'sweet', 'เค็ม': 'salty', 'มัน': 'fatty', 'เปรี้ยว': 'sour', 'เผ็ด': 'spicy' };
+const WAKE_FEEL_MAP   = { 'สดชื่น': 'refreshed', 'เฉยๆ': 'neutral', 'ยังง่วงอยู่': 'sleepy', 'ลุกไม่ไหว': 'exhausted' };
+const WALK_MAP        = { 'น้อยกว่า 1km': 'less_than_1km', '2-4km': '2-4km', '5-8km': '5-8km', 'มากกว่า 10km': 'more_than_10km' };
 
+// Trim + map lookup; returns undefined (dropped by clean) when not found.
+function standardizeValue(input, map) {
+  if (input == null) return undefined;
+  return map[input.trim()] ?? undefined;
+}
+
+// Convert Firestore ISO timestamp string → "HH:mm" local time.
+function formatTimeForAI(isoString) {
+  if (!isoString) return undefined;
+  try {
+    const d = new Date(isoString);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  } catch (_) {
+    return undefined;
+  }
+}
+
+// Recursively strip null, undefined, empty objects, and empty arrays
+// so the AI payload contains only meaningful data.
+function clean(data) {
+  if (Array.isArray(data)) {
+    const arr = data.map(clean).filter(v => v !== null && v !== undefined);
+    return arr.length ? arr : undefined;
+  }
+  if (data !== null && typeof data === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(data)) {
+      const c = clean(v);
+      if (c !== null && c !== undefined) out[k] = c;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  return data ?? undefined;
+}
+
+function buildAIUserPayload(user, reportType) {
+
+  // ---------- USER PROFILE ----------
   const payload = {
-    age: user.Age,
-    gender: user.Gender,
-    height_cm: user.height_cm,
-    weight_kg: user.weight_kg,
-    conditions: user.conditions,
+    report_type:    reportType,   // 'initial' | 'weekly'
+    age:            user.Age,
+    gender:         standardizeValue(user.Gender, GENDER_MAP),
+    height_cm:      user.height_cm,
+    weight_kg:      user.weight_kg,
+    conditions:     user.conditions,
     chronic_issues: user.chronic_issues,
   };
 
-  // ---------- HEALTH HISTORY ----------
-  if (Array.isArray(user.health_history) && user.health_history.length > 0) {
+  // ---------- BIOMARKERS ----------
+  const latest = Array.isArray(user.health_history) && user.health_history.length > 0
+    ? user.health_history[user.health_history.length - 1]
+    : null;
 
-    const latest = user.health_history[user.health_history.length - 1];
-
+  if (latest) {
     const biomarkers = {};
-
-    const numericFields = [
-      "HDL",
-      "fbs",
-      "LDL",
-      "Cholesterol",
-      "Triglycerides",
-      "systolic",
-      "diastolic",
-      "Heartrate"
-    ];
-
-    numericFields.forEach(field => {
-      const value = Number(latest[field]);
-      if (value > 0) {
-        biomarkers[field] = value;
-      }
-    });
-
-    if (Object.keys(biomarkers).length > 0) {
-      payload.biomarkers = biomarkers;
-    }
+    ['HDL', 'fbs', 'LDL', 'Cholesterol', 'Triglycerides', 'systolic', 'diastolic', 'Heartrate']
+      .forEach(f => { const n = Number(latest[f]); if (n > 0) biomarkers[f] = n; });
+    if (Object.keys(biomarkers).length) payload.biomarkers = biomarkers;
   }
 
   // ---------- DAILY LOGS ----------
-  payload.daily_logs = (user.daily_logs || []).map(log => ({
-    
-    log_date_key: log.log_date_key,
+  payload.daily_logs = (user.daily_logs || []).map(log => {
+    const mind      = log.mind      || {};
+    const sleep     = log.sleep     || {};
+    const risk      = log.risk      || {};
+    const nutrition = log.nutrition || {};
+    const exercise  = (log.exercise || [])[0] || {};
 
-    mood_score: log.mind?.mood_score,
-    stress_score: log.mind?.stress_score,
+    const rawSleep   = sleep.sleep_duration_hours;
+    const sleepHours = rawSleep != null
+      ? parseFloat(Number(rawSleep).toFixed(1))
+      : undefined;
 
-    sleep_hours: log.sleep?.sleep_duration_hours,
-    wakeup_feeling: log.sleep?.wakeup_feeling,
+    return {
+      log_date_key: log.log_date_key,
 
-    water_liters: log.nutrition?.water_liters,
+      mind: {
+        mood_score:          mind.mood_score,
+        stress_score:        mind.stress_score,
+        mindfulness_minutes: mind.mindfulness_minutes,
+        gratitude_done:      mind.gratitude_done,
+        social_interaction:  mind.social_interaction,
+      },
 
-    exercise: (log.exercise || []).map(e => ({
-      activity_level: e.activity_level,
-      mvpa_minutes: e.mvpa_minutes,
-      estimated_steps: e.estimated_steps,
-      prolonged_sitting: e.prolonged_sitting,
-      weight_training_today: e.resistance_today,
-    })),
+      sleep: {
+        bedtime:              formatTimeForAI(sleep.bedtime),
+        wake_time:            formatTimeForAI(sleep.wake_time),
+        sleep_duration_hours: sleepHours,
+        sleep_latency_min:    sleep.sleep_latency,
+        waso_min:             sleep.waso,
+        caffeine_after_2pm:   sleep.caffeine_after_2pm,
+        wakeup_feeling:       standardizeValue(sleep.wakeup_feeling, WAKE_FEEL_MAP),
+      },
 
-    meals: (log.nutrition?.meals || []).map(m => ({
-      meal_type: m.meal_type,
-      food: m.base_text,
-      portion: m.portion,
-      vegetable_level: m.veg_level,
-    })),
+      exercise: {
+        walking_distance:  standardizeValue(exercise.activity_level, WALK_MAP),
+        mvpa_minutes:      exercise.mvpa_minutes,
+        steps:             exercise.estimated_steps,
+        prolonged_sitting: exercise.prolonged_sitting,
+        strength_training: exercise.resistance_today,
+      },
 
-    upf: (log.nutrition?.upf_logs || []).map(u => ({
-      category: u.category_tag,
-      item: u.upf_item_name,
-      tastes: u.taste_tags,
-    })),
+      nutrition: {
+        water_liters: nutrition.water_liters,
+        meals: (nutrition.meals || []).map(m => ({
+          meal_type:       standardizeValue(m.meal_type, MEAL_TYPE_MAP),
+          food:            m.base_text,
+          portion:         standardizeValue(m.portion, PORTION_MAP),
+          vegetable_level: standardizeValue(m.veg_level, VEG_LEVEL_MAP),
+        })),
+        upf: (nutrition.upf_logs || []).map(u => ({
+          item:     u.upf_item_name,
+          category: standardizeValue(u.category_tag, UPF_TYPE_MAP),
+          portion:  standardizeValue(u.portion_size, UPF_PORTION_MAP),
+          reason:   u.reason_tag,
+          tastes:   (u.taste_tags || [])
+                      .map(t => standardizeValue(t, UPF_TASTE_MAP))
+                      .filter(Boolean),
+        })),
+      },
 
-    cigarettes: log.risk?.cigarettes_count,
-    alcohol_drinks: log.risk?.alcohol_drinks,
-    quit_intention_score: log.risk?.quit_intention_score,
-    first_cig_after_wake_min: log.risk?.first_cig_after_wake_min,
-  }));
+      risk: {
+        alcohol_drinks:   risk.alcohol_drinks,
+        cigarettes_count: risk.cigarettes_count,
+      },
+    };
+  });
 
-  return payload;
+  return clean(payload);
 }
 
 async function generateWeeklyReport(payload) {
