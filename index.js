@@ -5,11 +5,31 @@ const { onTaskDispatched } = require("firebase-functions/v2/tasks");
 const { onRequest } = require("firebase-functions/v2/https");
 const { Timestamp } = require("firebase-admin/firestore");
 
+// v1 compat used specifically for auth.user().onDelete —
+// v2 auth triggers require Identity Platform; v1 works with standard Firebase Auth.
+const functionsV1 = require("firebase-functions/v1");
+
 const admin = require("firebase-admin");
 const logger = require("firebase-functions/logger");
 const axios = require('axios');
 
 admin.initializeApp();
+
+// Triggered automatically when Firebase Auth deletes a user.
+// Recursively deletes the user's Firestore document and ALL subcollections:
+//   daily_logs, addresses, payment_methods, health_history, weekly_reports, fcm_tokens
+exports.onUserDeleted = functionsV1.region(REGION).auth.user().onDelete(async (user) => {
+  const uid = user.uid;
+  const userRef = admin.firestore().collection('users').doc(uid);
+
+  try {
+    await admin.firestore().recursiveDelete(userRef);
+    logger.info(`All Firestore data deleted for user: ${uid}`);
+  } catch (err) {
+    logger.error(`Failed to delete Firestore data for user: ${uid}`, err);
+    throw err;
+  }
+});
 
 // MANUAL TRIGGER for testing
 exports.manualDailyScan = onRequest({ region: REGION }, async (req, res) => {
@@ -305,11 +325,15 @@ function buildAIUserPayload(user) {
       activity_level: e.activity_level,
       mvpa_minutes: e.mvpa_minutes,
       estimated_steps: e.estimated_steps,
+      prolonged_sitting: e.prolonged_sitting,
+      weight_training_today: e.resistance_today,
     })),
 
     meals: (log.nutrition?.meals || []).map(m => ({
       meal_type: m.meal_type,
       food: m.base_text,
+      portion: m.portion,
+      vegetable_level: m.veg_level,
     })),
 
     upf: (log.nutrition?.upf_logs || []).map(u => ({
