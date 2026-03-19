@@ -284,6 +284,29 @@ function standardizeValue(input, map) {
   return map[input.trim()] ?? undefined;
 }
 
+function standardizeMood(moodScore) {
+  switch (moodScore) {
+    case 1: return 'sad';
+    case 2: return 'neutral';
+    case 3: return 'good';
+    case 4: return 'happy';
+    case 5: return 'great';
+    case 6: return 'angry';
+    default: return undefined;
+  }
+}
+
+function standardizeStress(stressScore) {
+  switch (stressScore) {
+    case 1: return 'very_relaxed';
+    case 2: return 'relaxed';
+    case 3: return 'calm';
+    case 4: return 'stressed';
+    case 5: return 'overwhelmed';
+    default: return undefined;
+  }
+}
+
 // Convert Firestore ISO timestamp string → "HH:mm" local time.
 function formatTimeForAI(isoString) {
   if (!isoString) return undefined;
@@ -359,8 +382,8 @@ function buildAIUserPayload(user, reportType) {
       log_date_key: log.log_date_key,
 
       mind: {
-        mood_score:          mind.mood_score,
-        stress_score:        mind.stress_score,
+        mood:                standardizeMood(mind.mood_score),
+        stress_label:        standardizeStress(mind.stress_score),
         mindfulness_minutes: mind.mindfulness_minutes,
         gratitude_done:      mind.gratitude_done,
         social_interaction:  mind.social_interaction,
