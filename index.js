@@ -3,6 +3,7 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { getFunctions } = require("firebase-admin/functions");
 const { onTaskDispatched } = require("firebase-functions/v2/tasks");
 const { onRequest } = require("firebase-functions/v2/https");
+const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { Timestamp } = require("firebase-admin/firestore");
 
 // v1 compat used specifically for auth.user().onDelete —
@@ -15,10 +16,32 @@ const axios = require('axios');
 
 admin.initializeApp();
 
-// Called by the app after a successful order to increment sold_qty on each
-// product. Uses admin SDK so Firestore security rules for products don't apply.
+// Shared helper: groups order items by product ref path, sums quantities,
+// and batch-increments sold_qty. Used by both the HTTP endpoint and the
+// Firestore trigger below.
+async function applyIncrementSoldQty(items) {
+  if (!items || items.length === 0) return 0;
+  const db = admin.firestore();
+  const qtyByPath = {};
+  for (const item of items) {
+    if (item.product) {
+      const path = item.product.path; // DocumentReference → string path
+      qtyByPath[path] = (qtyByPath[path] ?? 0) + (item.quantity ?? 1);
+    }
+  }
+  const batch = db.batch();
+  for (const [path, qty] of Object.entries(qtyByPath)) {
+    batch.update(db.doc(path), {
+      sold_qty: admin.firestore.FieldValue.increment(qty),
+    });
+  }
+  await batch.commit();
+  return Object.keys(qtyByPath).length;
+}
+
+// Admin-utility HTTP endpoint: manually increment sold_qty for a given order.
+// Requires a valid Firebase ID token. Kept for admin/debugging purposes.
 exports.incrementSoldQty = onRequest({ region: REGION }, async (req, res) => {
-  // Verify the caller is an authenticated app user.
   const authHeader = req.headers.authorization ?? '';
   if (!authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -37,34 +60,46 @@ exports.incrementSoldQty = onRequest({ region: REGION }, async (req, res) => {
   try {
     const db = admin.firestore();
     const orderSnap = await db.collection('orders').doc(orderId).get();
-
     if (!orderSnap.exists) {
       return res.status(404).json({ error: 'Order not found' });
     }
-
-    const items = orderSnap.data().items ?? [];
-    if (items.length === 0) {
-      return res.status(200).json({ updated: 0 });
-    }
-
-    const batch = db.batch();
-    for (const item of items) {
-      // item.product is a Firestore DocumentReference stored in the order
-      if (item.product) {
-        batch.update(item.product, {
-          sold_qty: admin.firestore.FieldValue.increment(item.quantity ?? 1),
-        });
-      }
-    }
-    await batch.commit();
-
-    logger.info(`incrementSoldQty: updated ${items.length} products for order ${orderId}`);
-    return res.status(200).json({ success: true, updated: items.length });
+    const updated = await applyIncrementSoldQty(orderSnap.data().items ?? []);
+    logger.info(`incrementSoldQty: updated ${updated} products for order ${orderId}`);
+    return res.status(200).json({ success: true, updated });
   } catch (err) {
     logger.error('incrementSoldQty failed', { orderId, err });
     return res.status(500).json({ error: err.message });
   }
 });
+
+// Firestore trigger: fires when an order document is updated.
+// Increments sold_qty only on the transition TO 'ชำระเงินแล้ว' (paid),
+// ensuring inventory is decremented only after confirmed payment.
+exports.onOrderPaid = onDocumentUpdated(
+  { document: "orders/{orderId}", region: REGION },
+  async (event) => {
+    const before = event.data.before.data();
+    const after  = event.data.after.data();
+
+    // Idempotency guard: only act on the exact transition → 'ชำระเงินแล้ว'.
+    // If status was already 'ชำระเงินแล้ว' before, this is a re-write/retry —
+    // skip to avoid double-counting.
+    if (after.status !== 'ชำระเงินแล้ว' || before.status === 'ชำระเงินแล้ว') {
+      return null;
+    }
+
+    const orderId = event.params.orderId;
+    try {
+      const updated = await applyIncrementSoldQty(after.items ?? []);
+      logger.info(`onOrderPaid: incremented sold_qty for ${updated} products`, { orderId });
+    } catch (err) {
+      logger.error('onOrderPaid: failed to increment sold_qty', { orderId, err });
+      // Not re-thrown: Cloud Functions would retry on unhandled rejection,
+      // which would double-increment. Log and exit cleanly instead.
+    }
+    return null;
+  }
+);
 
 // Triggered automatically when Firebase Auth deletes a user.
 // Recursively deletes the user's Firestore document and ALL subcollections:
