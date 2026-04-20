@@ -15,6 +15,57 @@ const axios = require('axios');
 
 admin.initializeApp();
 
+// Called by the app after a successful order to increment sold_qty on each
+// product. Uses admin SDK so Firestore security rules for products don't apply.
+exports.incrementSoldQty = onRequest({ region: REGION }, async (req, res) => {
+  // Verify the caller is an authenticated app user.
+  const authHeader = req.headers.authorization ?? '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+
+  const { orderId } = req.body ?? {};
+  if (!orderId) {
+    return res.status(400).json({ error: 'orderId is required' });
+  }
+
+  try {
+    const db = admin.firestore();
+    const orderSnap = await db.collection('orders').doc(orderId).get();
+
+    if (!orderSnap.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const items = orderSnap.data().items ?? [];
+    if (items.length === 0) {
+      return res.status(200).json({ updated: 0 });
+    }
+
+    const batch = db.batch();
+    for (const item of items) {
+      // item.product is a Firestore DocumentReference stored in the order
+      if (item.product) {
+        batch.update(item.product, {
+          sold_qty: admin.firestore.FieldValue.increment(item.quantity ?? 1),
+        });
+      }
+    }
+    await batch.commit();
+
+    logger.info(`incrementSoldQty: updated ${items.length} products for order ${orderId}`);
+    return res.status(200).json({ success: true, updated: items.length });
+  } catch (err) {
+    logger.error('incrementSoldQty failed', { orderId, err });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Triggered automatically when Firebase Auth deletes a user.
 // Recursively deletes the user's Firestore document and ALL subcollections:
 //   daily_logs, addresses, payment_methods, health_history, weekly_reports, fcm_tokens
