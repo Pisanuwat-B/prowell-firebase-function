@@ -73,7 +73,7 @@ exports.incrementSoldQty = onRequest({ region: REGION }, async (req, res) => {
 });
 
 // Firestore trigger: fires when an order document is updated.
-// Increments sold_qty only on the transition TO 'ชำระเงินแล้ว' (paid),
+// Increments sold_qty only on the transition TO 'ชำระเงินสำเร็จ' (paid),
 // ensuring inventory is decremented only after confirmed payment.
 exports.onOrderPaid = onDocumentUpdated(
   { document: "orders/{orderId}", region: REGION },
@@ -81,10 +81,10 @@ exports.onOrderPaid = onDocumentUpdated(
     const before = event.data.before.data();
     const after  = event.data.after.data();
 
-    // Idempotency guard: only act on the exact transition → 'ชำระเงินแล้ว'.
-    // If status was already 'ชำระเงินแล้ว' before, this is a re-write/retry —
+    // Idempotency guard: only act on the exact transition → 'ชำระเงินสำเร็จ'.
+    // If status was already 'ชำระเงินสำเร็จ' before, this is a re-write/retry —
     // skip to avoid double-counting.
-    if (after.status !== 'ชำระเงินแล้ว' || before.status === 'ชำระเงินแล้ว') {
+    if (after.status !== 'ชำระเงินสำเร็จ' || before.status === 'ชำระเงินสำเร็จ') {
       return null;
     }
 
@@ -97,6 +97,182 @@ exports.onOrderPaid = onDocumentUpdated(
       // Not re-thrown: Cloud Functions would retry on unhandled rejection,
       // which would double-increment. Log and exit cleanly instead.
     }
+    return null;
+  }
+);
+
+// HTTP endpoint: collects all admin FCM tokens and sends a push notification
+// for a paid order. Called by the main app immediately after payment succeeds.
+// Requires a valid Firebase ID token in the Authorization header.
+exports.notifyAdminsOrderPaid = onRequest({ region: REGION }, async (req, res) => {
+  const authHeader = req.headers.authorization ?? '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+
+  const { orderId } = req.body ?? {};
+  if (!orderId) return res.status(400).json({ error: 'orderId is required' });
+
+  try {
+    const db = admin.firestore();
+
+    const orderSnap = await db.collection('orders').doc(orderId).get();
+    if (!orderSnap.exists) return res.status(404).json({ error: 'Order not found' });
+    const order = orderSnap.data();
+
+    const adminsSnap = await db.collection('users').where('role', '==', 'admin').get();
+    if (adminsSnap.empty) {
+      logger.info('notifyAdminsOrderPaid: no admin users found');
+      return res.status(200).json({ success: true, sent: 0 });
+    }
+
+    // Build a flat list of { adminRef, token } so we can delete stale tokens
+    // from the correct subcollection after sending.
+    const tokenEntries = [];
+    await Promise.all(adminsSnap.docs.map(async (adminDoc) => {
+      const tokensSnap = await adminDoc.ref.collection('admin_fcm_tokens').get();
+      tokensSnap.forEach(t => {
+        const token = t.data().token;
+        if (token) tokenEntries.push({ adminRef: adminDoc.ref, token });
+      });
+    }));
+
+    if (tokenEntries.length === 0) {
+      logger.info('notifyAdminsOrderPaid: no admin_fcm_tokens found');
+      return res.status(200).json({ success: true, sent: 0 });
+    }
+
+    const tokens = tokenEntries.map(e => e.token);
+    const shortId = orderId.slice(-6).toUpperCase();
+    const amount = (order.total_amount ?? 0).toLocaleString('th-TH');
+
+    const fcmMessage = {
+      tokens,
+      notification: {
+        title: `ออเดอร์ #${shortId} ชำระเงินแล้ว`,
+        body: `ยอดรวม ฿${amount} — รอการจัดส่ง`,
+      },
+      data: { orderId, type: 'order_paid' },
+      android: { priority: 'high' },
+      apns: { payload: { aps: { sound: 'default' } } },
+    };
+
+    const result = await admin.messaging().sendEachForMulticast(fcmMessage);
+
+    // Clean up any tokens that FCM rejected so we don't keep retrying them.
+    const batch = db.batch();
+    result.responses.forEach((r, idx) => {
+      if (!r.success) {
+        const code = r.error?.code;
+        if (
+          code === 'messaging/registration-token-not-registered' ||
+          code === 'messaging/invalid-registration-token'
+        ) {
+          const { adminRef, token } = tokenEntries[idx];
+          batch.delete(adminRef.collection('admin_fcm_tokens').doc(token));
+          logger.warn('notifyAdminsOrderPaid: removed stale token', { token });
+        } else {
+          logger.error('notifyAdminsOrderPaid: FCM error', { code: r.error?.code, msg: r.error?.message });
+        }
+      }
+    });
+    await batch.commit();
+
+    logger.info('notifyAdminsOrderPaid done', { orderId, success: result.successCount, failure: result.failureCount });
+    return res.status(200).json({ success: true, sent: result.successCount });
+  } catch (err) {
+    logger.error('notifyAdminsOrderPaid failed', { orderId, err });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Firestore trigger: fires when an order transitions to 'จัดส่งสำเร็จ' (shipped).
+// Sends an FCM push notification to the customer with the carrier + tracking number.
+exports.onOrderShipped = onDocumentUpdated(
+  { document: "orders/{orderId}", region: REGION },
+  async (event) => {
+    const before = event.data.before.data();
+    const after  = event.data.after.data();
+
+    // Idempotency guard: only act on the exact transition → 'จัดส่งสำเร็จ'.
+    if (after.status !== 'จัดส่งสำเร็จ' || before.status === 'จัดส่งสำเร็จ') {
+      return null;
+    }
+
+    const orderId   = event.params.orderId;
+    const userRef   = after.user_ref; // Firestore DocumentReference
+
+    if (!userRef) {
+      logger.warn('onOrderShipped: order has no user_ref', { orderId });
+      return null;
+    }
+
+    const db = admin.firestore();
+    const tokensSnap = await db.doc(userRef.path).collection('fcm_tokens').get();
+
+    if (tokensSnap.empty) {
+      logger.info('onOrderShipped: no FCM tokens for user', { orderId });
+      return null;
+    }
+
+    const tokens         = tokensSnap.docs.map(doc => doc.id);
+    const trackingNumber = after.tracking_number  ?? '';
+    const carrier        = after.shipping_carrier ?? '';
+    const shortId        = orderId.slice(-6).toUpperCase();
+
+    const bodyParts = [];
+    if (carrier)        bodyParts.push(carrier);
+    if (trackingNumber) bodyParts.push(`เลขพัสดุ: ${trackingNumber}`);
+    const body = bodyParts.length > 0
+      ? bodyParts.join(' · ')
+      : 'ติดตามสถานะพัสดุได้แล้ว';
+
+    const fcmMessage = {
+      tokens,
+      notification: {
+        title: `คำสั่งซื้อ #${shortId} ถูกจัดส่งแล้ว 🚚`,
+        body,
+      },
+      data: { type: 'order_shipped', orderId },
+      android: { priority: 'high' },
+      apns:    { payload: { aps: { sound: 'default' } } },
+    };
+
+    try {
+      const result = await admin.messaging().sendEachForMulticast(fcmMessage);
+
+      // Clean up stale tokens so we don't keep retrying them.
+      const batch = db.batch();
+      result.responses.forEach((r, idx) => {
+        if (!r.success) {
+          const code = r.error?.code;
+          if (
+            code === 'messaging/registration-token-not-registered' ||
+            code === 'messaging/invalid-registration-token'
+          ) {
+            batch.delete(db.doc(userRef.path).collection('fcm_tokens').doc(tokens[idx]));
+            logger.warn('onOrderShipped: removed stale token', { token: tokens[idx] });
+          } else {
+            logger.error('onOrderShipped: FCM error', { code, msg: r.error?.message });
+          }
+        }
+      });
+      await batch.commit();
+
+      logger.info('onOrderShipped: notification sent', {
+        orderId,
+        success: result.successCount,
+        failure: result.failureCount,
+      });
+    } catch (err) {
+      logger.error('onOrderShipped: failed to send FCM', { orderId, err });
+    }
+
     return null;
   }
 );
@@ -610,3 +786,4 @@ async function sendWeeklyReportNotification(userId, reportType) {
 
   await batch.commit();
 }
+
